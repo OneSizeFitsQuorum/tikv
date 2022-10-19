@@ -583,6 +583,7 @@ where
         &mut self,
         delegate: &mut ApplyDelegate<EK>,
         results: VecDeque<ExecResult<EK::Snapshot>>,
+        first_index: u64,
     ) {
         if !delegate.pending_remove {
             delegate.write_apply_state(self.kv_wb_mut());
@@ -595,6 +596,7 @@ where
             metrics: delegate.metrics.clone(),
             applied_term: delegate.applied_term,
             bucket_stat: delegate.buckets.clone().map(Box::new),
+            first_index,
         });
     }
 
@@ -972,22 +974,26 @@ where
         // must re-propose these commands again.
         apply_ctx.committed_count += committed_entries_drainer.len();
         let mut results = VecDeque::new();
+        let mut first_index = None;
         while let Some(entry) = committed_entries_drainer.next() {
+            if first_index.is_none() {
+                first_index = Some(entry.get_index());
+            }
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
             }
 
-            let expect_index = self.apply_state.get_applied_index() + 1;
-            if expect_index != entry.get_index() {
-                panic!(
-                    "{} expect index {}, but got {}, ctx {}",
-                    self.tag,
-                    expect_index,
-                    entry.get_index(),
-                    apply_ctx.tag,
-                );
-            }
+            // let expect_index = self.apply_state.get_applied_index() + 1;
+            // if expect_index != entry.get_index() {
+            //     panic!(
+            //         "{} expect index {}, but got {}, ctx {}",
+            //         self.tag,
+            //         expect_index,
+            //         entry.get_index(),
+            //         apply_ctx.tag,
+            //     );
+            // }
 
             // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by
             // `unimplemented!()`, which can break compatibility (i.e. old version tikv
@@ -1011,7 +1017,7 @@ where
                     // Note that current entry is skipped when yield.
                     pending_entries.push(entry);
                     pending_entries.extend(committed_entries_drainer);
-                    apply_ctx.finish_for(self, results);
+                    apply_ctx.finish_for(self, results, first_index.unwrap());
                     self.yield_state = Some(YieldState {
                         pending_entries,
                         pending_msgs: Vec::default(),
@@ -1024,7 +1030,7 @@ where
                 }
             }
         }
-        apply_ctx.finish_for(self, results);
+        apply_ctx.finish_for(self, results, first_index.unwrap());
 
         if self.pending_remove {
             self.destroy(apply_ctx);
@@ -3313,6 +3319,7 @@ where
 {
     pub region_id: u64,
     pub apply_state: RaftApplyState,
+    pub first_index: u64,
     pub applied_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
     pub metrics: ApplyMetrics,

@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
     u64,
 };
+use std::collections::BTreeMap;
 
 use batch_system::{BasicMailbox, Fsm};
 use collections::{HashMap, HashSet};
@@ -100,6 +101,7 @@ use crate::{
     },
     Error, Result,
 };
+use crate::store::fsm::ApplyRes;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DelayDestroy {
@@ -170,6 +172,8 @@ where
     /// Before actually destroying a peer, ensure all log gc tasks are finished,
     /// so we can start destroying without seeking.
     logs_gc_flushed: bool,
+
+    pending_apply_res: BTreeMap<u64, ApplyRes<EK::Snapshot>>,
 }
 
 pub struct BatchRaftCmdRequestBuilder<E>
@@ -288,6 +292,7 @@ where
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
                 logs_gc_flushed: false,
+                pending_apply_res: BTreeMap::new(),
             }),
         ))
     }
@@ -342,6 +347,7 @@ where
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
                 logs_gc_flushed: false,
+                pending_apply_res: BTreeMap::new(),
             }),
         ))
     }
@@ -2150,32 +2156,64 @@ where
                     "peer_id" => self.fsm.peer_id(),
                     "res" => ?res,
                 );
-                self.on_ready_result(&mut res.exec_res, &res.metrics);
-                if self.fsm.stopped {
-                    return;
-                }
-                let applied_index = res.apply_state.applied_index;
-                let buckets = self.fsm.peer.region_buckets.as_mut();
-                if let (Some(delta), Some(buckets)) = (res.bucket_stat, buckets) {
-                    merge_bucket_stats(
-                        &buckets.meta.keys,
-                        &mut buckets.stats,
-                        &delta.meta.keys,
-                        &delta.stats,
+                if res.first_index == self.fsm.peer.get_store().applied_index() + 1 {
+                    self.on_ready_result(&mut res.exec_res, &res.metrics);
+                    if self.fsm.stopped {
+                        return;
+                    }
+                    let mut applied_index = res.apply_state.applied_index;
+                    let buckets = self.fsm.peer.region_buckets.as_mut();
+                    if let (Some(delta), Some(buckets)) = (res.bucket_stat, buckets) {
+                        merge_bucket_stats(
+                            &buckets.meta.keys,
+                            &mut buckets.stats,
+                            &delta.meta.keys,
+                            &delta.stats,
+                        );
+                    }
+                    self.fsm.has_ready |= self.fsm.peer.post_apply(
+                        self.ctx,
+                        res.apply_state,
+                        res.applied_term,
+                        &res.metrics,
                     );
-                }
-                self.fsm.has_ready |= self.fsm.peer.post_apply(
-                    self.ctx,
-                    res.apply_state,
-                    res.applied_term,
-                    &res.metrics,
-                );
-                // After applying, several metrics are updated, report it to pd to
-                // get fair schedule.
-                if self.fsm.peer.is_leader() {
-                    self.register_pd_heartbeat_tick();
-                    self.register_split_region_check_tick();
-                    self.retry_pending_prepare_merge(applied_index);
+                    while let Some(x) = self.fsm.pending_apply_res.first_key_value() {
+                        assert!(*x.0 >= applied_index + 1);
+                        if *x.0 == applied_index + 1 {
+                            let (_, mut v) = self.fsm.pending_apply_res.pop_first().unwrap();
+                            self.on_ready_result(&mut v.exec_res, &v.metrics);
+                            if self.fsm.stopped {
+                                return;
+                            }
+                            applied_index = v.apply_state.get_applied_index();
+                            let buckets = self.fsm.peer.region_buckets.as_mut();
+                            if let (Some(delta), Some(buckets)) = (v.bucket_stat, buckets) {
+                                merge_bucket_stats(
+                                    &buckets.meta.keys,
+                                    &mut buckets.stats,
+                                    &delta.meta.keys,
+                                    &delta.stats,
+                                );
+                            }
+                            self.fsm.has_ready |= self.fsm.peer.post_apply(
+                                self.ctx,
+                                v.apply_state,
+                                v.applied_term,
+                                &v.metrics,
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                    // After applying, several metrics are updated, report it to pd to
+                    // get fair schedule.
+                    if self.fsm.peer.is_leader() {
+                        self.register_pd_heartbeat_tick();
+                        self.register_split_region_check_tick();
+                        self.retry_pending_prepare_merge(applied_index);
+                    }
+                } else {
+                    assert!(self.fsm.pending_apply_res.insert(res.first_index, res).is_none());
                 }
             }
             ApplyTaskRes::Destroy {
