@@ -6,6 +6,7 @@ use std::{
     cell::Cell,
     cmp,
     collections::{
+        BTreeMap,
         Bound::{Excluded, Unbounded},
         VecDeque,
     },
@@ -15,7 +16,6 @@ use std::{
     time::{Duration, Instant},
     u64,
 };
-use std::collections::BTreeMap;
 
 use batch_system::{BasicMailbox, Fsm};
 use collections::{HashMap, HashSet};
@@ -72,8 +72,8 @@ use crate::{
         fsm::{
             apply,
             store::{PollContext, StoreMeta},
-            ApplyMetrics, ApplyTask, ApplyTaskRes, CatchUpLogs, ChangeObserver, ChangePeer,
-            ExecResult,
+            ApplyMetrics, ApplyRes, ApplyTask, ApplyTaskRes, CatchUpLogs, ChangeObserver,
+            ChangePeer, ExecResult,
         },
         hibernate_state::{GroupState, HibernateState},
         local_metrics::{RaftMetrics, TimeTracker},
@@ -101,7 +101,6 @@ use crate::{
     },
     Error, Result,
 };
-use crate::store::fsm::ApplyRes;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DelayDestroy {
@@ -2213,7 +2212,12 @@ where
                         self.retry_pending_prepare_merge(applied_index);
                     }
                 } else {
-                    assert!(self.fsm.pending_apply_res.insert(res.first_index, res).is_none());
+                    assert!(
+                        self.fsm
+                            .pending_apply_res
+                            .insert(res.first_index, res)
+                            .is_none()
+                    );
                 }
             }
             ApplyTaskRes::Destroy {

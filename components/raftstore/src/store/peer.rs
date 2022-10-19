@@ -2771,6 +2771,7 @@ where
         );
         // Leader needs to update lease.
         let mut lease_to_be_updated = self.is_leader();
+        let mut can_parallel = true;
         for entry in committed_entries.iter().rev() {
             // raft meta is very small, can be ignored.
             self.raft_log_size_hint += entry.get_data().len() as u64;
@@ -2791,7 +2792,15 @@ where
                     lease_to_be_updated = false;
                 }
             }
-
+            if can_parallel == true {
+                if entry.get_entry_type() != EntryType::EntryNormal {
+                    can_parallel = false;
+                }
+                let ctx = ProposalContext::from_bytes(&entry.context);
+                if !ctx.is_empty() {
+                    can_parallel = false;
+                }
+            }
             fail_point!(
                 "leader_commit_prepare_merge",
                 {
@@ -2857,8 +2866,16 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_entry_cache(false);
             }
-            ctx.apply_router
-                .schedule_task(self.region_id, ApplyTask::apply(apply));
+            if self.raft_group.raft.r.state == StateRole::Leader
+                && self.cmd_epoch_checker.proposed_admin_cmd.is_empty()
+                && can_parallel
+            {
+                ctx.apply_router
+                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+            } else {
+                ctx.apply_router
+                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+            }
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }
