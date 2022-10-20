@@ -818,6 +818,8 @@ where
 
     /// The counter records pending snapshot requests.
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    /// The counter records pending parallel tasks.
+    pub pending_parallel_task_num: Arc<AtomicUsize>,
     /// The index of last scheduled committed raft log.
     pub last_applying_idx: u64,
     /// The index of last compacted raft log. It is used for the next compact
@@ -1047,6 +1049,7 @@ where
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             flashback_state: None,
+            pending_parallel_task_num: Arc::new(AtomicUsize::new(0)),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1116,6 +1119,10 @@ where
     pub fn activate<T>(&self, ctx: &PollContext<EK, ER, T>) {
         ctx.apply_router
             .schedule_task(self.region_id, ApplyTask::register(self));
+
+        for sender in ctx.parallel_apply_senders.senders() {
+            let _ = sender.send((self.region_id, ApplyTask::register(self)));
+        }
 
         ctx.coprocessor_host.on_region_changed(
             self.region(),
@@ -2870,8 +2877,10 @@ where
                 && self.cmd_epoch_checker.proposed_admin_cmd.is_empty()
                 && can_parallel
             {
-                ctx.apply_router
-                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+                self.pending_parallel_task_num
+                    .fetch_add(1, Ordering::SeqCst);
+                ctx.parallel_apply_senders
+                    .schedule_task((self.region_id, ApplyTask::apply(apply)));
             } else {
                 ctx.apply_router
                     .schedule_task(self.region_id, ApplyTask::apply(apply));

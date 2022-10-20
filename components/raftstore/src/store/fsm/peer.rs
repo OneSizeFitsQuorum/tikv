@@ -13,6 +13,7 @@ use std::{
     iter::{FromIterator, Iterator},
     mem,
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
     u64,
 };
@@ -2155,6 +2156,7 @@ where
                     "peer_id" => self.fsm.peer_id(),
                     "res" => ?res,
                 );
+                // println!("{:?} {:?}", thread::current().name(), res);
                 if res.first_index == self.fsm.peer.get_store().applied_index() + 1 {
                     self.on_ready_result(&mut res.exec_res, &res.metrics);
                     if self.fsm.stopped {
@@ -3911,6 +3913,7 @@ where
         if is_leader {
             self.on_split_region_check_tick();
         }
+        self.fsm.peer.activate(self.ctx);
         fail_point!("after_split", self.ctx.store_id() == 3, |_| {});
     }
 

@@ -46,7 +46,7 @@ impl<Owner: Fsm> BasicMailbox<Owner> {
         }
     }
 
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.sender.is_sender_connected()
     }
 

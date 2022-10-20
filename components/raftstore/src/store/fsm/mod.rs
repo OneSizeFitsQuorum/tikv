@@ -6,6 +6,7 @@
 
 pub mod apply;
 mod metrics;
+pub mod parallel_apply;
 mod peer;
 pub mod store;
 

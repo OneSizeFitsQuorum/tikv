@@ -76,6 +76,7 @@ use crate::{
         fsm::{
             create_apply_batch_system,
             metrics::*,
+            parallel_apply::{ParallelApplySenders, ParallelApplySystem},
             peer::{
                 maybe_destroy_source, new_admin_request, PeerFsm, PeerFsmDelegate, SenderFsmPair,
             },
@@ -521,6 +522,8 @@ where
     pub write_senders: WriteSenders<EK, ER>,
     pub sync_write_worker: Option<WriteWorker<EK, ER, RaftRouter<EK, ER>, T>>,
     pub pending_latency_inspect: Vec<util::LatencyInspector>,
+
+    pub parallel_apply_senders: ParallelApplySenders<EK>,
 }
 
 impl<EK, ER, T> PollContext<EK, ER, T>
@@ -1081,6 +1084,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     feature_gate: FeatureGate,
     write_senders: WriteSenders<EK, ER>,
+    parallel_apply_senders: ParallelApplySenders<EK>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1327,6 +1331,7 @@ where
             write_senders: self.write_senders.clone(),
             sync_write_worker,
             pending_latency_inspect: vec![],
+            parallel_apply_senders: self.parallel_apply_senders.clone(),
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
@@ -1378,6 +1383,7 @@ where
             global_replication_state: self.global_replication_state.clone(),
             feature_gate: self.feature_gate.clone(),
             write_senders: self.write_senders.clone(),
+            parallel_apply_senders: self.parallel_apply_senders.clone(),
         }
     }
 }
@@ -1406,6 +1412,7 @@ pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
     system: BatchSystem<PeerFsm<EK, ER>, StoreFsm<EK>>,
     apply_router: ApplyRouter<EK>,
     apply_system: ApplyBatchSystem<EK>,
+    parallel_apply_system: ParallelApplySystem<EK>,
     router: RaftRouter<EK, ER>,
     workers: Option<Workers<EK, ER>>,
     store_writers: StoreWriters<EK, ER>,
@@ -1574,6 +1581,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             feature_gate: pd_client.feature_gate().clone(),
             write_senders: self.store_writers.senders(),
+            parallel_apply_senders: ParallelApplySenders::new(),
         };
         let region_peers = builder.init()?;
         self.start_system::<T, C>(
@@ -1595,7 +1603,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         &mut self,
         mut workers: Workers<EK, ER>,
         region_peers: Vec<SenderFsmPair<EK, ER>>,
-        builder: RaftPollerBuilder<EK, ER, T>,
+        mut builder: RaftPollerBuilder<EK, ER, T>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         snap_mgr: SnapManager,
@@ -1614,6 +1622,19 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         );
         self.apply_system
             .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
+
+        self.parallel_apply_system.spawn::<T, ER>(
+            &builder,
+            Box::new(self.router.clone()),
+            &self.apply_router.clone(),
+        )?;
+
+        self.parallel_apply_system
+            .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
+
+        builder
+            .parallel_apply_senders
+            .set_senders(self.parallel_apply_system.senders().clone());
 
         {
             let mut meta = builder.store_meta.lock().unwrap();
@@ -1705,6 +1726,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         workers.pd_worker.stop();
 
         self.apply_system.shutdown();
+        self.parallel_apply_system.shutdown();
         MEMTRACE_APPLY_ROUTER_ALIVE.trace(TraceEvent::Reset(0));
         MEMTRACE_APPLY_ROUTER_LEAK.trace(TraceEvent::Reset(0));
 
@@ -1740,6 +1762,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
         workers: None,
         apply_router,
         apply_system,
+        parallel_apply_system: ParallelApplySystem::new(),
         router: raft_router.clone(),
         store_writers: StoreWriters::default(),
     };

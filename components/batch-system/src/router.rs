@@ -33,7 +33,7 @@ struct NormalMailMap<N: Fsm> {
     alive_cnt: Arc<AtomicUsize>,
 }
 
-enum CheckDoResult<T> {
+pub enum CheckDoResult<T> {
     NotExist,
     Invalid,
     Valid(T),
@@ -114,7 +114,7 @@ where
     /// but it returns None after apply the given function. Some(Some) means
     /// the given function returns Some and cache is updated if it's invalid.
     #[inline]
-    fn check_do<F, R>(&self, addr: u64, mut f: F) -> CheckDoResult<R>
+    pub fn check_do<F, R>(&self, addr: u64, mut f: F) -> CheckDoResult<R>
     where
         F: FnMut(&BasicMailbox<N>) -> Option<R>,
     {

@@ -79,7 +79,7 @@ use crate::{
     store::{
         cmd_resp,
         entry_storage::{self, CachedEntries},
-        fsm::RaftPollerBuilder,
+        fsm::{ApplyTask, RaftPollerBuilder},
         local_metrics::{RaftMetrics, TimeTracker},
         memory::*,
         metrics::*,
@@ -343,7 +343,7 @@ pub trait Notifier<EK: KvEngine>: Send {
     fn clone_box(&self) -> Box<dyn Notifier<EK>>;
 }
 
-struct ApplyContext<EK>
+pub(crate) struct ApplyContext<EK>
 where
     EK: KvEngine,
 {
@@ -363,6 +363,11 @@ where
     kv_wb: EK::WriteBatch,
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
+
+    is_parallel_applying: bool,
+    // only used in parallel worker
+    pub parallel_apply_tasks: HashMap<u64, Arc<AtomicUsize>>,
+    task_counts: HashMap<u64, usize>,
 
     committed_count: usize,
 
@@ -426,6 +431,7 @@ where
         notifier: Box<dyn Notifier<EK>>,
         cfg: &Config,
         store_id: u64,
+        is_parallel_applying: bool,
         pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
         priority: Priority,
     ) -> ApplyContext<EK> {
@@ -443,6 +449,9 @@ where
             kv_wb,
             applied_batch: ApplyCallbackBatch::new(),
             apply_res: vec![],
+            is_parallel_applying,
+            parallel_apply_tasks: HashMap::default(),
+            task_counts: HashMap::default(),
             exec_log_index: 0,
             exec_log_term: 0,
             kv_wb_last_bytes: 0,
@@ -482,7 +491,9 @@ where
     /// This call is valid only when it's between a `prepare_for` and
     /// `finish_for`.
     pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
-        if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index() {
+        if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index()
+            && !self.is_parallel_applying
+        {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         self.commit_opt(delegate, true);
@@ -572,6 +583,23 @@ where
                 tracker.observe(now, &self.apply_time, |t| &mut t.metrics.apply_time_nanos);
             }
             cb.invoke_with_response(resp);
+        }
+        if self.is_parallel_applying {
+            let counts = mem::replace(&mut self.task_counts, HashMap::default());
+            for (region_id, task_num) in counts {
+                let pre_num = self
+                    .parallel_apply_tasks
+                    .get(&region_id)
+                    .unwrap()
+                    .fetch_sub(task_num, Ordering::SeqCst);
+                if pre_num == task_num {
+                    self.router.schedule_noop_task_when_not_empty(region_id);
+                }
+            }
+            if !self.apply_res.is_empty() {
+                let apply_res = mem::take(&mut self.apply_res);
+                self.notifier.notify(apply_res);
+            }
         }
         self.apply_time.flush();
         self.apply_wait.flush();
@@ -871,6 +899,8 @@ where
     pending_cmds: PendingCmdQueue<Callback<EK::Snapshot>>,
     /// The counter of pending request snapshots. See more in `Peer`.
     pending_request_snapshot_count: Arc<AtomicUsize>,
+    /// The counter of pending parallel tasks. See more in `Peer`.
+    pending_parallel_task_num: Arc<AtomicUsize>,
 
     /// Indicates the peer is in merging, if that compact log won't be
     /// performed.
@@ -941,6 +971,7 @@ where
             metrics: Default::default(),
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
+            pending_parallel_task_num: reg.pending_parallel_task_num,
             // use a default `CmdObserveInfo` because observing is disable by default
             observe_info: CmdObserveInfo::default(),
             priority: Priority::Normal,
@@ -3054,6 +3085,7 @@ pub struct Registration {
     pub applied_term: u64,
     pub region: Region,
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
+    pub pending_parallel_task_num: Arc<AtomicUsize>,
     pub is_merging: bool,
     raft_engine: Box<dyn RaftEngineReadOnly>,
 }
@@ -3067,6 +3099,7 @@ impl Registration {
             applied_term: peer.get_store().applied_term(),
             region: peer.region().clone(),
             pending_request_snapshot_count: peer.pending_request_snapshot_count.clone(),
+            pending_parallel_task_num: peer.pending_parallel_task_num.clone(),
             is_merging: peer.pending_merge_state.is_some(),
             raft_engine: Box::new(peer.get_store().engines.raft.clone()),
         }
@@ -3362,7 +3395,9 @@ where
         ApplyFsm::from_registration(reg)
     }
 
-    fn from_registration(reg: Registration) -> (LooseBoundedSender<Msg<EK>>, Box<ApplyFsm<EK>>) {
+    pub(crate) fn from_registration(
+        reg: Registration,
+    ) -> (LooseBoundedSender<Msg<EK>>, Box<ApplyFsm<EK>>) {
         let (tx, rx) = loose_bounded(usize::MAX);
         let delegate = ApplyDelegate::from_registration(reg);
         (
@@ -3445,17 +3480,17 @@ where
             buckets.meta = meta;
         }
 
-        let prev_state = (
-            self.delegate.apply_state.get_commit_index(),
-            self.delegate.apply_state.get_commit_term(),
-        );
+        // let prev_state = (
+        //     self.delegate.apply_state.get_commit_index(),
+        //     self.delegate.apply_state.get_commit_term(),
+        // );
         let cur_state = (apply.commit_index, apply.commit_term);
-        if prev_state.0 > cur_state.0 || prev_state.1 > cur_state.1 {
-            panic!(
-                "{} commit state jump backward {:?} -> {:?}",
-                self.delegate.tag, prev_state, cur_state
-            );
-        }
+        // if prev_state.0 > cur_state.0 || prev_state.1 > cur_state.1 {
+        //     panic!(
+        //         "{} commit state jump backward {:?} -> {:?}",
+        //         self.delegate.tag, prev_state, cur_state
+        //     );
+        // }
         self.delegate.apply_state.set_commit_index(cur_state.0);
         self.delegate.apply_state.set_commit_term(cur_state.1);
 
@@ -3742,7 +3777,11 @@ where
         cb.invoke_read(resp);
     }
 
-    fn handle_tasks(&mut self, apply_ctx: &mut ApplyContext<EK>, msgs: &mut Vec<Msg<EK>>) {
+    pub(crate) fn handle_tasks(
+        &mut self,
+        apply_ctx: &mut ApplyContext<EK>,
+        msgs: &mut Vec<Msg<EK>>,
+    ) {
         let mut drainer = msgs.drain(..);
         let mut batch_apply = None;
         loop {
@@ -3784,7 +3823,13 @@ where
                             t.metrics.apply_wait_nanos = apply_wait.as_nanos() as u64;
                         });
                     }
-
+                    if apply_ctx.is_parallel_applying {
+                        apply_ctx
+                            .task_counts
+                            .entry(self.delegate.region_id())
+                            .and_modify(|counter| *counter += 1)
+                            .or_insert(1);
+                    }
                     if let Some(batch) = batch_apply.as_mut() {
                         if batch.try_batch(&mut apply) {
                             continue;
@@ -3814,6 +3859,37 @@ where
                     let delegate = &self.delegate as *const ApplyDelegate<EK> as *const u8;
                     f(delegate)
                 }
+            }
+        }
+    }
+
+    pub(crate) fn handle_task(&mut self, apply_ctx: &mut ApplyContext<EK>, msg: Msg<EK>) {
+        match msg {
+            Msg::Apply { start, apply } => {
+                let apply_wait = start.saturating_elapsed();
+                apply_ctx.apply_wait.observe(apply_wait.as_secs_f64());
+                for tracker in apply
+                    .cbs
+                    .iter()
+                    .flat_map(|p| p.cb.write_trackers())
+                    .flat_map(|ts| ts.iter().flat_map(|t| t.as_tracker_token()))
+                {
+                    GLOBAL_TRACKERS.with_tracker(tracker, |t| {
+                        t.metrics.apply_wait_nanos = apply_wait.as_nanos() as u64;
+                    });
+                }
+                if apply_ctx.is_parallel_applying {
+                    apply_ctx
+                        .task_counts
+                        .entry(self.delegate.region_id())
+                        .and_modify(|counter| *counter += 1)
+                        .or_insert(1);
+                }
+                self.handle_apply(apply_ctx, apply);
+            }
+            Msg::Registration(reg) => self.handle_registration(reg),
+            m => {
+                panic!("Unexpected msg in Parallel Apply Worker {:?}", m);
             }
         }
     }
@@ -3998,6 +4074,17 @@ where
             normal.delegate.id() == 1003,
             |_| { HandleResult::KeepProcessing }
         );
+
+        if normal
+            .delegate
+            .pending_parallel_task_num
+            .load(Ordering::SeqCst)
+            > 0
+        {
+            handle_result = HandleResult::stop_at(normal.receiver.len(), true);
+            return handle_result;
+        }
+
         while self.msg_buf.len() < self.messages_per_tick {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
@@ -4093,6 +4180,7 @@ where
                 self.sender.clone_box(),
                 &cfg,
                 self.store_id,
+                false,
                 self.pending_create_peers.clone(),
                 priority,
             ),
@@ -4234,6 +4322,19 @@ where
         let (sender, apply_fsm) = ApplyFsm::from_registration(reg);
         let mailbox = BasicMailbox::new(sender, apply_fsm, self.state_cnt().clone());
         self.register(region_id, mailbox);
+    }
+
+    pub fn schedule_noop_task_when_not_empty(&self, addr: u64) {
+        self.check_do(addr, |mailbox| {
+            if mailbox.is_connected() && !mailbox.is_empty() {
+                // we only schedule a Noop ApplyTask when there are some pending messages in
+                // ApplyBatchSystem
+                self.schedule_task(addr, ApplyTask::Noop);
+                Some(0)
+            } else {
+                None
+            }
+        });
     }
 
     pub fn register(&self, region_id: u64, mailbox: BasicMailbox<ApplyFsm<EK>>) {
