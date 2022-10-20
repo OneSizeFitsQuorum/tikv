@@ -1007,6 +1007,10 @@ where
                 storage_error(format!("could not load raft state of region {}", region_id))
             })
         })?;
+    // info!(
+    //     "begin to assert apply_state";
+    //     "region_id" => region_id,
+    // );
     assert_eq!(apply_state, last_applied_state);
 
     let key = SnapKey::new(

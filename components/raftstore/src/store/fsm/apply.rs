@@ -16,6 +16,7 @@ use std::{
         mpsc::SyncSender,
         Arc, Mutex,
     },
+    thread,
     time::Duration,
     usize,
     vec::Drain,
@@ -585,7 +586,7 @@ where
             cb.invoke_with_response(resp);
         }
         if self.is_parallel_applying {
-            let counts = mem::replace(&mut self.task_counts, HashMap::default());
+            let counts = mem::take(&mut self.task_counts);
             for (region_id, task_num) in counts {
                 let pre_num = self
                     .parallel_apply_tasks
@@ -613,7 +614,7 @@ where
         results: VecDeque<ExecResult<EK::Snapshot>>,
         first_index: u64,
     ) {
-        if !delegate.pending_remove {
+        if !delegate.pending_remove && !self.is_parallel_applying {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         self.commit_opt(delegate, false);
@@ -1074,6 +1075,12 @@ where
     }
 
     fn write_apply_state(&self, wb: &mut EK::WriteBatch) {
+        // info!(
+        //     "write apply state";
+        //     "apply_state" => self.apply_state.applied_index,
+        //     "region_id" => self.region.get_id(),
+        //     "thread" => thread::current().name().unwrap().to_owned()
+        // );
         wb.put_msg_cf(
             CF_RAFT,
             &keys::apply_state_key(self.region.get_id()),
@@ -1323,7 +1330,7 @@ where
                     // clear dirty values.
                     ctx.kv_wb_mut().rollback_to_save_point().unwrap();
                     match e {
-                        Error::EpochNotMatch(..) => debug!(
+                        Error::EpochNotMatch(..) => info!(
                             "epoch not match";
                             "region_id" => self.region_id(),
                             "peer_id" => self.id(),
@@ -1344,6 +1351,15 @@ where
             return (resp, exec_result, false);
         }
 
+        let name = thread::current().name().unwrap().to_owned();
+        info!(
+            "update apply_state 2";
+            "old_index" => self.apply_state.applied_index,
+            "new_index" => index,
+            "region_id" => self.region_id(),
+            "isAdmin" => req.has_admin_request(),
+            "thread" => &name,
+        );
         self.apply_state.set_applied_index(index);
         self.applied_term = term;
 
@@ -1527,7 +1543,7 @@ where
             AdminCmdType::ChangePeerV2 => self.exec_change_peer_v2(ctx, request),
             AdminCmdType::Split => self.exec_split(ctx, request),
             AdminCmdType::BatchSplit => self.exec_batch_split(ctx, request),
-            AdminCmdType::CompactLog => self.exec_compact_log(request),
+            AdminCmdType::CompactLog => self.exec_compact_log(ctx, request),
             AdminCmdType::TransferLeader => self.exec_transfer_leader(request, ctx.exec_log_term),
             AdminCmdType::ComputeHash => self.exec_compute_hash(ctx, request),
             AdminCmdType::VerifyHash => self.exec_verify_hash(ctx, request),
@@ -2781,6 +2797,7 @@ where
 
     fn exec_compact_log(
         &mut self,
+        ctx: &mut ApplyContext<EK>,
         req: &AdminRequest,
     ) -> Result<(AdminResponse, ApplyResult<EK::Snapshot>)> {
         PEER_ADMIN_CMD_COUNTER.compact.all.inc();
@@ -2824,14 +2841,17 @@ where
         }
 
         // compact failure is safe to be omitted, no need to assert.
-        compact_raft_log(
-            &self.tag,
-            &mut self.apply_state,
-            compact_index,
-            compact_term,
-        )?;
-
-        PEER_ADMIN_CMD_COUNTER.compact.success.inc();
+        // currently, compact_log may be sent to ApplyBatchSystem or to a Parallel Apply
+        // Worker, but we only do the actual processing in ApplyBatchSystem
+        if !ctx.is_parallel_applying {
+            compact_raft_log(
+                &self.tag,
+                &mut self.apply_state,
+                compact_index,
+                compact_term,
+            )?;
+            PEER_ADMIN_CMD_COUNTER.compact.success.inc();
+        }
 
         Ok((
             resp,
@@ -3417,7 +3437,8 @@ where
             "re-register to apply delegates";
             "region_id" => self.delegate.region_id(),
             "peer_id" => self.delegate.id(),
-            "term" => reg.term
+            "term" => reg.term,
+            "applied_index" => reg.apply_state.applied_index
         );
         assert_eq!(self.delegate.id, reg.id);
         self.delegate.term = reg.term;
@@ -3672,6 +3693,16 @@ where
             apply_ctx.flush();
             self.delegate.last_flush_applied_index = applied_index;
         }
+
+        // let name = thread::current().name().unwrap().to_owned();
+        //
+        // info!(
+        //     "gen snapshot";
+        //     "apply_state" => self.delegate.apply_state.applied_index,
+        //     "region_id" => self.delegate.region_id(),
+        //     "thread" => name,
+        //     "flush" => need_sync,
+        // );
 
         if let Err(e) = snap_task.generate_and_schedule_snapshot::<EK>(
             apply_ctx.engine.snapshot(),
@@ -4081,7 +4112,14 @@ where
             .load(Ordering::SeqCst)
             > 0
         {
-            handle_result = HandleResult::stop_at(normal.receiver.len(), true);
+            // let name = thread::current().name().unwrap().to_owned();
+            // info!(
+            //     "wait for parallel worker";
+            //     "apply_state" => normal.delegate.apply_state.applied_index,
+            //     "region_id" => normal.delegate.region_id(),
+            //     "thread" => name,
+            // );
+            handle_result = HandleResult::stop_at(normal.receiver.len(), false);
             return handle_result;
         }
 

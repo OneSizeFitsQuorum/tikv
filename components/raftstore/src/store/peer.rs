@@ -1132,6 +1132,13 @@ where
         self.maybe_gen_approximate_buckets(ctx);
     }
 
+    /// Register self to parallel apply worker so that the peer is then usable.
+    pub fn activate_parallel_worker<T>(&self, ctx: &PollContext<EK, ER, T>) {
+        for sender in ctx.parallel_apply_senders.senders() {
+            let _ = sender.send((self.region_id, ApplyTask::register(self)));
+        }
+    }
+
     #[inline]
     fn next_proposal_index(&self) -> u64 {
         self.raft_group.raft.raft_log.last_index() + 1
@@ -2800,9 +2807,17 @@ where
                 }
             }
             if can_parallel == true {
+                // Only logs in the current term can be parallelized.
+                // This judgment prevents raft logs from being unconstrained parallelized and
+                // breaking consistency when restarts or leader switches.
+                if entry.get_term() != self.raft_group.raft.r.term {
+                    can_parallel = false;
+                }
+                // ConfChange logs cannot be parallelized
                 if entry.get_entry_type() != EntryType::EntryNormal {
                     can_parallel = false;
                 }
+                // Admin logs cannot be parallelized
                 let ctx = ProposalContext::from_bytes(&entry.context);
                 if !ctx.is_empty() {
                     can_parallel = false;

@@ -91,13 +91,13 @@ where
 
     fn run(&mut self) {
         while let Some(m) = self.fetch_msg() {
-            let name = thread::current().name().unwrap().to_owned();
-            // println!("{:?} {:?}", name, m);
             if m.0 == 0 {
                 break;
             }
             let apply_fsm = self.peers.get_mut(&m.0);
             if let Some(p) = apply_fsm {
+                // TODO: we might be able to do some batching for normal logs like the
+                // handle_tasks, but it's unclear what the benefits would be
                 p.handle_task(&mut self.apply_ctx, m.1);
             } else {
                 if let Msg::Registration(r) = m.1 {
@@ -115,7 +115,6 @@ where
                 }
             }
         }
-        println!("Parallel Apply worker exits");
     }
 }
 
@@ -168,7 +167,7 @@ where
             };
             let props = tikv_util::thread_group::current_properties();
             let t = thread::Builder::new()
-                .name(thd_name!(format!("apply-{}", i)))
+                .name(thd_name!(format!("Parallel-Apply-{}", i)))
                 .spawn(move || {
                     tikv_util::thread_group::set_properties(props);
                     worker.run();
