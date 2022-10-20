@@ -460,6 +460,9 @@
 ## threads to generate raft snapshots
 # snap-generator-pool-size = 2
 
+## whether to enable parallel apply
+# enable-parallel-apply = false
+
 [coprocessor]
 ## When it is set to `true`, TiKV will try to split a Region with table prefix if that Region
 ## crosses tables.

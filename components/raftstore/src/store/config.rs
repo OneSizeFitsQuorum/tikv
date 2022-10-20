@@ -303,6 +303,8 @@ pub struct Config {
     pub max_snapshot_file_raw_size: ReadableSize,
 
     pub unreachable_backoff: ReadableDuration,
+
+    pub enable_parallel_apply: bool,
 }
 
 impl Default for Config {
@@ -407,6 +409,7 @@ impl Default for Config {
             report_region_buckets_tick_interval: ReadableDuration::secs(10),
             max_snapshot_file_raw_size: ReadableSize::mb(100),
             unreachable_backoff: ReadableDuration::secs(10),
+            enable_parallel_apply: true,
         }
     }
 }

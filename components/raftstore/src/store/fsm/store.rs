@@ -1623,18 +1623,20 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         self.apply_system
             .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
 
-        self.parallel_apply_system.spawn::<T, ER>(
-            &builder,
-            Box::new(self.router.clone()),
-            &self.apply_router.clone(),
-        )?;
+        if builder.cfg.value().enable_parallel_apply {
+            self.parallel_apply_system.spawn::<T, ER>(
+                &builder,
+                Box::new(self.router.clone()),
+                &self.apply_router.clone(),
+            )?;
 
-        self.parallel_apply_system
-            .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
+            self.parallel_apply_system
+                .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
 
-        builder
-            .parallel_apply_senders
-            .set_senders(self.parallel_apply_system.senders().clone());
+            builder
+                .parallel_apply_senders
+                .set_senders(self.parallel_apply_system.senders().clone());
+        }
 
         {
             let mut meta = builder.store_meta.lock().unwrap();

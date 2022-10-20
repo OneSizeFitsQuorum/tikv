@@ -2806,7 +2806,7 @@ where
                     lease_to_be_updated = false;
                 }
             }
-            if can_parallel == true {
+            if ctx.cfg.enable_parallel_apply && can_parallel == true {
                 // Only logs in the current term can be parallelized.
                 // This judgment prevents raft logs from being unconstrained parallelized and
                 // breaking consistency when restarts or leader switches.
@@ -2888,8 +2888,10 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_entry_cache(false);
             }
-            if self.raft_group.raft.r.state == StateRole::Leader
+            if ctx.cfg.enable_parallel_apply
+                && self.raft_group.raft.r.state == StateRole::Leader
                 && self.cmd_epoch_checker.proposed_admin_cmd.is_empty()
+                && self.pending_request_snapshot_count.load(Ordering::SeqCst) == 0
                 && can_parallel
             {
                 self.pending_parallel_task_num
