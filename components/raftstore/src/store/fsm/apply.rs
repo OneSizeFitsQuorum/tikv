@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::{
     borrow::Cow,
     cmp,
-    cmp::{Ord, Ordering as CmpOrdering},
+    cmp::{min, Ord, Ordering as CmpOrdering},
     collections::VecDeque,
     fmt::{self, Debug, Formatter},
     mem,
@@ -366,6 +366,7 @@ where
     kv_wb_last_keys: u64,
 
     is_parallel_applying: bool,
+    enable_parallel_applying: bool,
     // only used in parallel worker
     pub parallel_apply_tasks: HashMap<u64, Arc<AtomicUsize>>,
     task_counts: HashMap<u64, usize>,
@@ -450,6 +451,7 @@ where
             kv_wb,
             applied_batch: ApplyCallbackBatch::new(),
             apply_res: vec![],
+            enable_parallel_applying: cfg.enable_parallel_apply,
             is_parallel_applying,
             parallel_apply_tasks: HashMap::default(),
             task_counts: HashMap::default(),
@@ -903,6 +905,9 @@ where
     /// The counter of pending parallel tasks. See more in `Peer`.
     pending_parallel_task_num: Arc<AtomicUsize>,
 
+    /// The counter of pending messages after one loop
+    pending_msg_num_after_one_loop: usize,
+
     /// Indicates the peer is in merging, if that compact log won't be
     /// performed.
     is_merging: bool,
@@ -973,6 +978,7 @@ where
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
             pending_parallel_task_num: reg.pending_parallel_task_num,
+            pending_msg_num_after_one_loop: 0,
             // use a default `CmdObserveInfo` because observing is disable by default
             observe_info: CmdObserveInfo::default(),
             priority: Priority::Normal,
@@ -4106,34 +4112,99 @@ where
             |_| { HandleResult::KeepProcessing }
         );
 
-        if normal
-            .delegate
-            .pending_parallel_task_num
-            .load(Ordering::SeqCst)
-            > 0
-        {
-            // let name = thread::current().name().unwrap().to_owned();
-            // info!(
-            //     "wait for parallel worker";
-            //     "apply_state" => normal.delegate.apply_state.applied_index,
-            //     "region_id" => normal.delegate.region_id(),
-            //     "thread" => name,
-            // );
-            handle_result = HandleResult::stop_at(normal.receiver.len(), false);
-            return handle_result;
-        }
+        if self.apply_ctx.enable_parallel_applying {
+            // In the current implementation, RaftBatchSystem will route the admin log to
+            // ApplyBatchSystem when it encounters an admin log. Before the ApplyRes for
+            // admin log is returned to RaftBatchSystem, All logs are routed to
+            // ApplyBatchSystem. Therefore, it is necessary to verify that all logs
+            // of the Parallel Apply Worker have been processed before executing
+            // admin logs in ApplyBatchSystem.
+            //
+            // However, all messages may not be processed in one loop. If the ApplyRes in
+            // the first loop contains admin logs, the RaftBatchSystem is returned
+            // to continue routing the normal logs to the Parallel Apply Worker. The
+            // normal logs piled up in ApplyBatchSystem may be starving, because they can
+            // not be executed in next loop, so we need to find a way to execute
+            // these logs.
+            //
+            // However, RaftBatchSystem may still encounter admin logs and route them to
+            // ApplyBatchSystem again, while ApplyBatchSystem may still have logs that
+            // have not been executed at this time, and the Parallel Apply Worker may not
+            // have finished executing the intermediate logs. We still need to ensure that
+            // the new admin logs that are routed to ApplyBatchSystem still meet the
+            // corresponding constraints. That is, the admin log can be executed only after
+            // all previous logs are executed.
 
-        while self.msg_buf.len() < self.messages_per_tick {
-            match normal.receiver.try_recv() {
-                Ok(msg) => self.msg_buf.push(msg),
-                Err(TryRecvError::Empty) => {
-                    handle_result = HandleResult::stop_at(0, false);
-                    break;
+            // The solution:
+            //
+            // we record the remaining number of msg in the receiver in each loop, and judge
+            // whether the number of msg in the receiver is still consistent in the next
+            // loop. If the number is consistent, it means that no new logs are routed to
+            // ApplyBatchSystem, so there may be starving problem at this time, we need to
+            // continue to execute the logs in parallel with the Parallel Apply Worker,
+            // otherwise it indicates that at lease a new admin log has been routed to
+            // ApplyBatchSystem, and there is no starving problem at this time. We
+            // continue to wait until all the logs in the Parallel Apply Worker have
+            // been executed before executing this batch of logs.
+            //
+            let len = normal.receiver.len();
+            if len > normal.delegate.pending_msg_num_after_one_loop
+                && normal
+                    .delegate
+                    .pending_parallel_task_num
+                    .load(Ordering::SeqCst)
+                    > 0
+            {
+                // let name = thread::current().name().unwrap().to_owned();
+                // info!(
+                //     "wait for parallel worker";
+                //     "apply_state" => normal.delegate.apply_state.applied_index,
+                //     "region_id" => normal.delegate.region_id(),
+                //     "thread" => name,
+                // );
+                handle_result = HandleResult::stop_at(normal.receiver.len(), false);
+                return handle_result;
+            }
+
+            // Prevent reading the log that was just routed to applyBatchSystem after the
+            // above judgment
+            let times = min(len, self.messages_per_tick);
+            while self.msg_buf.len() < times {
+                match normal.receiver.try_recv() {
+                    Ok(msg) => self.msg_buf.push(msg),
+                    Err(TryRecvError::Empty) => {
+                        unreachable!();
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        normal.delegate.stopped = true;
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
                 }
-                Err(TryRecvError::Disconnected) => {
-                    normal.delegate.stopped = true;
-                    handle_result = HandleResult::stop_at(0, false);
-                    break;
+            }
+
+            // If no new logs are routed in at this time, they should be the same, otherwise
+            // the latter will be larger and the next loop will need to wait instead of
+            // continuing.
+            normal.delegate.pending_msg_num_after_one_loop =
+                min(len - times, normal.receiver.len());
+
+            if normal.receiver.is_empty() {
+                handle_result = HandleResult::stop_at(0, false);
+            }
+        } else {
+            while self.msg_buf.len() < self.messages_per_tick {
+                match normal.receiver.try_recv() {
+                    Ok(msg) => self.msg_buf.push(msg),
+                    Err(TryRecvError::Empty) => {
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        normal.delegate.stopped = true;
+                        handle_result = HandleResult::stop_at(0, false);
+                        break;
+                    }
                 }
             }
         }
