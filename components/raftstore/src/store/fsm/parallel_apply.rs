@@ -166,8 +166,9 @@ where
                 peers: HashMap::default(),
             };
             let props = tikv_util::thread_group::current_properties();
+            let name = thd_name!(format!("parallel-apply-{}", i));
             let t = thread::Builder::new()
-                .name(thd_name!(format!("Parallel-Apply-{}", i)))
+                .name(name)
                 .spawn(move || {
                     tikv_util::thread_group::set_properties(props);
                     worker.run();

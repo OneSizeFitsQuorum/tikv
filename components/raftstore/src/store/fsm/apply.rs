@@ -16,7 +16,6 @@ use std::{
         mpsc::SyncSender,
         Arc, Mutex,
     },
-    thread,
     time::Duration,
     usize,
     vec::Drain,
@@ -1357,15 +1356,15 @@ where
             return (resp, exec_result, false);
         }
 
-        let name = thread::current().name().unwrap().to_owned();
-        info!(
-            "update apply_state 2";
-            "old_index" => self.apply_state.applied_index,
-            "new_index" => index,
-            "region_id" => self.region_id(),
-            "isAdmin" => req.has_admin_request(),
-            "thread" => &name,
-        );
+        // let name = thread::current().name().unwrap().to_owned();
+        // info!(
+        //     "update apply_state 2";
+        //     "old_index" => self.apply_state.applied_index,
+        //     "new_index" => index,
+        //     "region_id" => self.region_id(),
+        //     "isAdmin" => req.has_admin_request(),
+        //     "thread" => &name,
+        // );
         self.apply_state.set_applied_index(index);
         self.applied_term = term;
 
